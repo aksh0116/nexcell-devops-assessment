@@ -17,6 +17,11 @@ env:
   APP_IMAGE: nexcell-app:${{ github.sha }}
 
 jobs:
+
+  # =========================================================
+  # TEST JOB
+  # Runs on every Pull Request and every push to main
+  # =========================================================
   test:
     name: Build and smoke test
     runs-on: ubuntu-latest
@@ -26,7 +31,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # -------------------------------------------------------
+      # Make sure required CI variables exist
+      # -------------------------------------------------------
       - name: Validate CI configuration
+        shell: bash
         run: |
           test -n "$POSTGRES_USER" || {
             echo "CI_POSTGRES_USER is missing"
@@ -48,29 +57,55 @@ jobs:
             exit 1
           }
 
+      # -------------------------------------------------------
+      # Check smoke-test script syntax
+      # -------------------------------------------------------
       - name: Validate smoke test syntax
         run: bash -n smoke_test.sh
 
+      # -------------------------------------------------------
+      # Build production image exactly once
+      # Tag = Git commit SHA
+      # -------------------------------------------------------
       - name: Build production image
         run: docker build -t "$APP_IMAGE" .
 
+      # -------------------------------------------------------
+      # Confirm important Dockerfile settings
+      # -------------------------------------------------------
       - name: Verify image configuration
+        shell: bash
         run: |
           test "$(docker inspect "$APP_IMAGE" \
             --format '{{.Config.User}}')" = "appuser"
 
+          echo "Container runs as appuser"
+
           docker inspect "$APP_IMAGE" \
             --format '{{json .Config.Healthcheck}}'
 
+      # -------------------------------------------------------
+      # Pull only supporting infrastructure
+      # The application image was already built above
+      # -------------------------------------------------------
       - name: Pull infrastructure images
         run: docker compose pull postgres redis
 
+      # -------------------------------------------------------
+      # Start Compose using EXACT image already built by CI
+      # --no-build prevents Compose building another image
+      # -------------------------------------------------------
       - name: Start stack with tested image
         run: docker compose up -d --no-build
 
+      # -------------------------------------------------------
+      # Wait until API + Redis + Postgres are actually ready
+      # -------------------------------------------------------
       - name: Wait for application readiness
+        shell: bash
         run: |
           for attempt in {1..30}; do
+
             if curl -fsS \
               --connect-timeout 2 \
               --max-time 5 \
@@ -85,11 +120,22 @@ jobs:
           done
 
           echo "Application did not become ready"
+
           docker compose ps -a
           docker compose logs --no-color
+
           exit 1
 
+      # -------------------------------------------------------
+      # Explicitly verify:
+      # API healthy
+      # Worker healthy
+      # Redis healthy
+      # Postgres healthy
+      # Migration exit code = 0
+      # -------------------------------------------------------
       - name: Verify container health and migration
+        shell: bash
         run: |
           api_id="$(docker compose ps -q api)"
           worker_id="$(docker compose ps -q worker)"
@@ -97,29 +143,69 @@ jobs:
           postgres_id="$(docker compose ps -q postgres)"
           migrate_id="$(docker compose ps -a -q migrate)"
 
-          test -n "$api_id"
-          test -n "$worker_id"
-          test -n "$redis_id"
-          test -n "$postgres_id"
-          test -n "$migrate_id"
+          test -n "$api_id" || {
+            echo "API container not found"
+            exit 1
+          }
+
+          test -n "$worker_id" || {
+            echo "Worker container not found"
+            exit 1
+          }
+
+          test -n "$redis_id" || {
+            echo "Redis container not found"
+            exit 1
+          }
+
+          test -n "$postgres_id" || {
+            echo "Postgres container not found"
+            exit 1
+          }
+
+          test -n "$migrate_id" || {
+            echo "Migration container not found"
+            exit 1
+          }
 
           for attempt in {1..30}; do
-            api_health="$(docker inspect \
-              --format '{{.State.Health.Status}}' "$api_id")"
 
-            worker_health="$(docker inspect \
-              --format '{{.State.Health.Status}}' "$worker_id")"
+            api_health="$(
+              docker inspect \
+                --format '{{.State.Health.Status}}' \
+                "$api_id"
+            )"
 
-            redis_health="$(docker inspect \
-              --format '{{.State.Health.Status}}' "$redis_id")"
+            worker_health="$(
+              docker inspect \
+                --format '{{.State.Health.Status}}' \
+                "$worker_id"
+            )"
 
-            postgres_health="$(docker inspect \
-              --format '{{.State.Health.Status}}' "$postgres_id")"
+            redis_health="$(
+              docker inspect \
+                --format '{{.State.Health.Status}}' \
+                "$redis_id"
+            )"
 
-            migration_exit="$(docker inspect \
-              --format '{{.State.ExitCode}}' "$migrate_id")"
+            postgres_health="$(
+              docker inspect \
+                --format '{{.State.Health.Status}}' \
+                "$postgres_id"
+            )"
 
-            echo "API=${api_health} Worker=${worker_health} Redis=${redis_health} Postgres=${postgres_health} MigrationExit=${migration_exit}"
+            migration_exit="$(
+              docker inspect \
+                --format '{{.State.ExitCode}}' \
+                "$migrate_id"
+            )"
+
+            echo "Attempt ${attempt}:"
+            echo "API=${api_health}"
+            echo "Worker=${worker_health}"
+            echo "Redis=${redis_health}"
+            echo "Postgres=${postgres_health}"
+            echo "MigrationExit=${migration_exit}"
 
             if [[ "$api_health" == "healthy" \
               && "$worker_health" == "healthy" \
@@ -135,18 +221,36 @@ jobs:
           done
 
           echo "Container health/status verification failed"
+
           docker compose ps -a
           exit 1
 
+      # -------------------------------------------------------
+      # Display final Compose state
+      # -------------------------------------------------------
       - name: Show container status
         run: docker compose ps -a
 
+      # -------------------------------------------------------
+      # Independently verify:
+      # /health
+      # /ready
+      # Redis
+      # Worker job consumption
+      # -------------------------------------------------------
       - name: Run smoke tests
         run: ./smoke_test.sh
 
+      # -------------------------------------------------------
+      # MAIN ONLY:
+      # Save EXACT image that passed all tests.
+      #
+      # Deploy job will use this artifact instead of rebuilding.
+      # -------------------------------------------------------
       - name: Save tested image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: docker save "$APP_IMAGE" | gzip > nexcell-image.tar.gz
+        run: |
+          docker save "$APP_IMAGE" | gzip > nexcell-image.tar.gz
 
       - name: Upload tested image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -157,12 +261,489 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+      # -------------------------------------------------------
+      # Helpful information if any step fails
+      # -------------------------------------------------------
       - name: Show diagnostics on failure
         if: failure()
         run: |
+          echo "===== CONTAINER STATUS ====="
           docker compose ps -a
+
+          echo "===== CONTAINER LOGS ====="
           docker compose logs --no-color
 
+      # -------------------------------------------------------
+      # Always clean temporary CI resources
+      # -------------------------------------------------------
       - name: Clean up
         if: always()
         run: docker compose down -v --remove-orphans
+
+
+  # =========================================================
+  # DEPLOY JOB
+  #
+  # Runs ONLY when:
+  # 1. test job succeeds
+  # 2. event is push
+  # 3. branch is main
+  # 4. AWS_DEPLOY_ENABLED=true
+  #
+  # Otherwise it safely shows as skipped.
+  # =========================================================
+  deploy:
+    name: Deploy to ECS
+    needs: test
+
+    if: >
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.AWS_DEPLOY_ENABLED == 'true'
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+
+      API_SERVICE: ${{ vars.API_SERVICE }}
+      WORKER_SERVICE: ${{ vars.WORKER_SERVICE }}
+
+      MIGRATION_TASK_DEFINITION: ${{ vars.MIGRATION_TASK_DEFINITION }}
+
+      API_CONTAINER_NAME: ${{ vars.API_CONTAINER_NAME }}
+      WORKER_CONTAINER_NAME: ${{ vars.WORKER_CONTAINER_NAME }}
+      MIGRATION_CONTAINER_NAME: ${{ vars.MIGRATION_CONTAINER_NAME }}
+
+    steps:
+
+      # -------------------------------------------------------
+      # Fail clearly when deployment is enabled but configuration
+      # is incomplete.
+      # -------------------------------------------------------
+      - name: Validate deployment configuration
+        shell: bash
+        run: |
+          required_vars=(
+            AWS_REGION
+            AWS_ROLE_ARN
+            ECR_REPOSITORY
+            ECS_CLUSTER
+            API_SERVICE
+            WORKER_SERVICE
+            MIGRATION_TASK_DEFINITION
+            API_CONTAINER_NAME
+            WORKER_CONTAINER_NAME
+            MIGRATION_CONTAINER_NAME
+          )
+
+          for name in "${required_vars[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required deployment variable: ${name}"
+              exit 1
+            fi
+          done
+
+          echo "Deployment configuration validated"
+
+      # -------------------------------------------------------
+      # AWS authentication using GitHub OIDC.
+      #
+      # NO AWS_ACCESS_KEY_ID
+      # NO AWS_SECRET_ACCESS_KEY
+      # -------------------------------------------------------
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # -------------------------------------------------------
+      # Authenticate Docker to ECR
+      # -------------------------------------------------------
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # -------------------------------------------------------
+      # Download the EXACT image produced and tested
+      # by the test job.
+      # -------------------------------------------------------
+      - name: Download tested image
+        uses: actions/download-artifact@v4
+        with:
+          name: tested-image-${{ github.sha }}
+
+      # -------------------------------------------------------
+      # Load tested image and push SAME image to ECR.
+      #
+      # There is intentionally NO docker build here.
+      # -------------------------------------------------------
+      - name: Load and push tested image to ECR
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gunzip -c nexcell-image.tar.gz | docker load
+
+          LOCAL_IMAGE="nexcell-app:${GITHUB_SHA}"
+
+          docker image inspect "$LOCAL_IMAGE" > /dev/null
+
+          REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          IMAGE_URI="${REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+
+          echo "Using tested image:"
+          echo "$LOCAL_IMAGE"
+
+          echo "Publishing as:"
+          echo "$IMAGE_URI"
+
+          docker tag "$LOCAL_IMAGE" "$IMAGE_URI"
+          docker push "$IMAGE_URI"
+
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+      # =======================================================
+      # Migration + API + Worker deployment
+      # =======================================================
+      - name: Run migration and deploy services
+        shell: bash
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+
+        run: |
+          set -euo pipefail
+
+          # ---------------------------------------------------
+          # Helper:
+          # Get an existing ECS task definition,
+          # replace the image for one container,
+          # remove read-only AWS response fields,
+          # register a new revision,
+          # return the new task-definition ARN.
+          # ---------------------------------------------------
+          register_with_image() {
+            local source_task_definition="$1"
+            local container_name="$2"
+            local output_file="$3"
+
+            echo "Reading task definition: ${source_task_definition}" >&2
+
+            aws ecs describe-task-definition \
+              --task-definition "$source_task_definition" \
+              --query taskDefinition \
+              > current-task.json
+
+            if ! jq -e \
+              --arg name "$container_name" \
+              '.containerDefinitions[]
+                | select(.name == $name)' \
+              current-task.json > /dev/null; then
+
+              echo "Container ${container_name} not found"
+              echo "Task definition: ${source_task_definition}"
+              exit 1
+            fi
+
+            jq \
+              --arg image "$IMAGE_URI" \
+              --arg name "$container_name" \
+              '
+              del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .compatibilities,
+                .registeredAt,
+                .registeredBy
+              )
+              |
+              (
+                .containerDefinitions[]
+                | select(.name == $name)
+                | .image
+              ) = $image
+              ' \
+              current-task.json \
+              > "$output_file"
+
+            aws ecs register-task-definition \
+              --cli-input-json "file://${output_file}" \
+              --query 'taskDefinition.taskDefinitionArn' \
+              --output text
+          }
+
+
+          # ===================================================
+          # STEP 1
+          # Prepare migration task definition using the
+          # exact new SHA image.
+          # ===================================================
+
+          echo "Preparing migration task definition..."
+
+          MIGRATION_TD_ARN="$(
+            register_with_image \
+              "$MIGRATION_TASK_DEFINITION" \
+              "$MIGRATION_CONTAINER_NAME" \
+              migration-task.json
+          )"
+
+          echo "Migration task definition:"
+          echo "$MIGRATION_TD_ARN"
+
+
+          # ===================================================
+          # STEP 2
+          # Reuse API service network configuration so the
+          # migration task has the same VPC/subnet/security
+          # connectivity required for the database.
+          # ===================================================
+
+          echo "Reading ECS network configuration..."
+
+          NETWORK_CONFIG="$(
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$API_SERVICE" \
+              --query 'services[0].networkConfiguration' \
+              --output json
+          )"
+
+          if [[ -z "$NETWORK_CONFIG" || "$NETWORK_CONFIG" == "null" ]]; then
+            echo "Could not determine ECS network configuration"
+            exit 1
+          fi
+
+
+          # ===================================================
+          # STEP 3
+          # Override migration container command.
+          # ===================================================
+
+          OVERRIDES="$(
+            jq -nc \
+              --arg name "$MIGRATION_CONTAINER_NAME" \
+              '{
+                containerOverrides: [
+                  {
+                    name: $name,
+                    command: [
+                      "python",
+                      "-m",
+                      "app.migrate"
+                    ]
+                  }
+                ]
+              }'
+          )"
+
+
+          # ===================================================
+          # STEP 4
+          # Run migration BEFORE touching API or worker.
+          # ===================================================
+
+          echo "Running database migration..."
+
+          RUN_OUTPUT="$(
+            aws ecs run-task \
+              --cluster "$ECS_CLUSTER" \
+              --task-definition "$MIGRATION_TD_ARN" \
+              --launch-type FARGATE \
+              --network-configuration "$NETWORK_CONFIG" \
+              --overrides "$OVERRIDES"
+          )"
+
+
+          # ===================================================
+          # STEP 5
+          # Make sure migration task actually started.
+          # ===================================================
+
+          MIGRATION_TASK_ARN="$(
+            echo "$RUN_OUTPUT" |
+            jq -r '.tasks[0].taskArn // empty'
+          )"
+
+          if [[ -z "$MIGRATION_TASK_ARN" ]]; then
+
+            echo "Migration task could not be started"
+
+            echo "$RUN_OUTPUT" |
+              jq '.failures'
+
+            exit 1
+          fi
+
+          echo "Migration task started:"
+          echo "$MIGRATION_TASK_ARN"
+
+
+          # ===================================================
+          # STEP 6
+          # Wait for migration task to finish.
+          # ===================================================
+
+          aws ecs wait tasks-stopped \
+            --cluster "$ECS_CLUSTER" \
+            --tasks "$MIGRATION_TASK_ARN"
+
+
+          # ===================================================
+          # STEP 7
+          # Read migration container exit code.
+          # ===================================================
+
+          MIGRATION_EXIT_CODE="$(
+            aws ecs describe-tasks \
+              --cluster "$ECS_CLUSTER" \
+              --tasks "$MIGRATION_TASK_ARN" \
+              --query \
+              "tasks[0].containers[?name=='${MIGRATION_CONTAINER_NAME}'].exitCode | [0]" \
+              --output text
+          )"
+
+          echo "Migration exit code: ${MIGRATION_EXIT_CODE}"
+
+
+          # ===================================================
+          # STEP 8
+          # CRITICAL SAFETY GATE
+          #
+          # Migration failure means:
+          # DO NOT update API
+          # DO NOT update worker
+          # ===================================================
+
+          if [[ "$MIGRATION_EXIT_CODE" != "0" ]]; then
+
+            echo "Migration failed."
+            echo "API and worker deployment will NOT continue."
+
+            aws ecs describe-tasks \
+              --cluster "$ECS_CLUSTER" \
+              --tasks "$MIGRATION_TASK_ARN" \
+              --query \
+              'tasks[0].[stoppedReason,containers[*].[name,reason,exitCode]]'
+
+            exit 1
+          fi
+
+          echo "Migration succeeded."
+
+
+          # ===================================================
+          # STEP 9
+          # Read current API and worker task definitions.
+          # ===================================================
+
+          API_CURRENT_TD="$(
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$API_SERVICE" \
+              --query 'services[0].taskDefinition' \
+              --output text
+          )"
+
+          WORKER_CURRENT_TD="$(
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$WORKER_SERVICE" \
+              --query 'services[0].taskDefinition' \
+              --output text
+          )"
+
+
+          # ===================================================
+          # STEP 10
+          # Register API and worker task-definition revisions,
+          # both pointing at SAME SHA image.
+          # ===================================================
+
+          echo "Creating API task definition..."
+
+          API_NEW_TD="$(
+            register_with_image \
+              "$API_CURRENT_TD" \
+              "$API_CONTAINER_NAME" \
+              api-task.json
+          )"
+
+          echo "Creating worker task definition..."
+
+          WORKER_NEW_TD="$(
+            register_with_image \
+              "$WORKER_CURRENT_TD" \
+              "$WORKER_CONTAINER_NAME" \
+              worker-task.json
+          )"
+
+          echo "API task definition:"
+          echo "$API_NEW_TD"
+
+          echo "Worker task definition:"
+          echo "$WORKER_NEW_TD"
+
+
+          # ===================================================
+          # STEP 11
+          # Deploy API with rolling deployment + automatic
+          # circuit-breaker rollback.
+          # ===================================================
+
+          echo "Updating API service..."
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$API_SERVICE" \
+            --task-definition "$API_NEW_TD" \
+            --deployment-configuration \
+            'maximumPercent=200,minimumHealthyPercent=100,deploymentCircuitBreaker={enable=true,rollback=true}' \
+            > /dev/null
+
+
+          # ===================================================
+          # STEP 12
+          # Deploy worker using SAME SHA image.
+          # ===================================================
+
+          echo "Updating worker service..."
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$WORKER_SERVICE" \
+            --task-definition "$WORKER_NEW_TD" \
+            --deployment-configuration \
+            'maximumPercent=200,minimumHealthyPercent=100,deploymentCircuitBreaker={enable=true,rollback=true}' \
+            > /dev/null
+
+
+          # ===================================================
+          # STEP 13
+          # Wait until both services are stable.
+          # ===================================================
+
+          echo "Waiting for ECS services to become stable..."
+
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services \
+              "$API_SERVICE" \
+              "$WORKER_SERVICE"
+
+          echo "Deployment completed successfully."
+          echo "Image deployed:"
+          echo "$IMAGE_URI"
