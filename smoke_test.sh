@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 set -u
 set -o pipefail
 
@@ -13,7 +14,6 @@ fail() {
     exit 1
 }
 
-# Portable timeout wrapper: works on macOS and Linux.
 run_with_timeout() {
     local seconds="$1"
     shift
@@ -38,6 +38,7 @@ except subprocess.TimeoutExpired:
 
 if result.stdout:
     print(result.stdout, end="")
+
 if result.stderr:
     print(result.stderr, end="", file=sys.stderr)
 
@@ -48,7 +49,9 @@ PY
 echo "Running smoke tests..."
 
 # 1. API liveness
-if output=$(curl -fsS --connect-timeout 2 --max-time 5 \
+if output=$(curl -fsS \
+    --connect-timeout 2 \
+    --max-time 5 \
     "${API_URL}/health" 2>&1); then
     pass "API liveness /health"
 else
@@ -56,16 +59,19 @@ else
 fi
 
 # 2. API readiness
-if output=$(curl -fsS --connect-timeout 2 --max-time 5 \
+if output=$(curl -fsS \
+    --connect-timeout 2 \
+    --max-time 5 \
     "${API_URL}/ready" 2>&1); then
     pass "API readiness /ready"
 else
     fail "API readiness failed: ${output}"
 fi
 
-# 3. Redis
+# 3. Redis connectivity
 if output=$(run_with_timeout 5 \
     docker compose exec -T redis redis-cli ping 2>&1); then
+
     if [[ "$output" == *"PONG"* ]]; then
         pass "Redis PING"
     else
@@ -75,27 +81,32 @@ else
     fail "Redis check failed: ${output}"
 fi
 
-# 4. Worker consumes a unique Redis job
+# 4. Worker queue test
 job_id="smoke-$(date +%s)-$$"
 
 if ! output=$(run_with_timeout 5 \
-    docker compose exec -T redis redis-cli LPUSH jobs "$job_id" 2>&1); then
+    docker compose exec -T redis \
+    redis-cli LPUSH jobs "$job_id" 2>&1); then
+
     fail "Could not enqueue worker test job: ${output}"
 fi
 
 worker_ok=false
 
 for attempt in {1..10}; do
+
     output=$(run_with_timeout 5 \
-        docker compose exec -T redis redis-cli --raw \
-        GET worker:last_job 2>&1) || true
+        docker compose exec -T redis \
+        redis-cli --raw GET worker:last_job 2>&1) || true
 
     if [[ "$output" == "$job_id" ]]; then
         worker_ok=true
         break
     fi
 
-    sleep 1
+    if [[ "$attempt" -lt 10 ]]; then
+        sleep 1
+    fi
 done
 
 if [[ "$worker_ok" == true ]]; then
